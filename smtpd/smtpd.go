@@ -13,6 +13,7 @@ package smtpd
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -37,7 +38,8 @@ type Server struct {
 	ReadTimeout  time.Duration // optional read timeout
 	WriteTimeout time.Duration // optional write timeout
 
-	PlainAuth bool // advertise plain auth (assumes you're on SSL)
+	PlainAuth bool        // advertise plain auth (assumes you're on SSL)
+	TLSConfig *tls.Config // advertise STARTTLS and use the given config to upgrade the connection with
 
 	// OnNewConnection, if non-nil, is called on new connections.
 	// If it returns non-nil, the connection is closed.
@@ -218,6 +220,14 @@ func (s *session) serve() {
 		switch line.Verb() {
 		case "HELO", "EHLO":
 			s.handleHello(line.Verb(), line.Arg())
+		case "STARTTLS":
+			if s.srv.TLSConfig == nil {
+				s.sendlinef("502 5.5.2 Error: command not recognized")
+				continue
+			}
+			if err := s.handleStartTLS(); err != nil {
+				s.errorf("failed to start tls: %s", err)
+			}
 		case "QUIT":
 			s.sendlinef("221 2.0.0 Bye")
 			return
@@ -254,6 +264,9 @@ func (s *session) handleHello(greeting, host string) {
 	if s.srv.PlainAuth {
 		extensions = append(extensions, "250-AUTH PLAIN")
 	}
+	if s.srv.TLSConfig != nil {
+		extensions = append(extensions, "250-STARTTLS")
+	}
 	extensions = append(extensions, "250-PIPELINING",
 		"250-SIZE 10240000",
 		"250-ENHANCEDSTATUSCODES",
@@ -263,6 +276,20 @@ func (s *session) handleHello(greeting, host string) {
 		fmt.Fprintf(s.bw, "%s\r\n", ext)
 	}
 	s.bw.Flush()
+}
+
+func (s *session) handleStartTLS() error {
+	s.sendlinef("220 Ready to start TLS")
+	tlsConn := tls.Server(s.rwc, s.srv.TLSConfig)
+	err := tlsConn.Handshake()
+	if err != nil {
+		s.sendSMTPErrorOrLinef(err, "403 4.7.0 TLS handshake failed")
+		return err
+	}
+	s.rwc = net.Conn(tlsConn)
+	s.bw.Reset(s.rwc)
+	s.br.Reset(s.rwc)
+	return nil
 }
 
 func (s *session) handleMailFrom(email string) {
