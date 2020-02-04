@@ -20,6 +20,7 @@ import (
 	"net"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -27,7 +28,8 @@ import (
 
 var (
 	rcptToRE   = regexp.MustCompile(`^[Tt][Oo]:<(.+)>`)
-	mailFromRE = regexp.MustCompile(`^[Ff][Rr][Oo][Mm]:<(.*)>`)
+	mailFromRE = regexp.MustCompile(`^[Ff][Rr][Oo][Mm]:<([^>]*)>(.*)$`)
+	mailSizeRE = regexp.MustCompile(`[Ss][Ii][Zz][Ee]=(\d+)`)
 )
 
 // Server is an SMTP server.
@@ -39,6 +41,7 @@ type Server struct {
 
 	PlainAuth bool        // advertise plain auth (assumes you're on SSL)
 	TLSConfig *tls.Config // advertise STARTTLS and use the given config to upgrade the connection with
+	MaxSize   int         // maximum email size to report
 
 	// OnNewConnection, if non-nil, is called on new connections.
 	// If it returns non-nil, the connection is closed.
@@ -46,7 +49,7 @@ type Server struct {
 
 	// OnNewMail must be defined and is called when a new message beings.
 	// (when a MAIL FROM line arrives)
-	OnNewMail func(c Connection, from MailAddress) (Envelope, error)
+	OnNewMail func(c Connection, from MailAddress, size *int) (Envelope, error)
 }
 
 // MailAddress is defined by
@@ -243,7 +246,18 @@ func (s *session) serve() {
 				s.sendlinef("501 5.1.7 Bad sender address syntax")
 				continue
 			}
-			s.handleMailFrom(m[1])
+			var size *int
+			if len(m) == 3 && len(m[2]) > 0 {
+				if sizeMatch := mailSizeRE.FindStringSubmatch(m[2]); sizeMatch != nil {
+					parsedSize, err := strconv.Atoi(sizeMatch[1])
+					if err != nil {
+						s.sendlinef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
+						continue
+					}
+					size = &parsedSize
+				}
+			}
+			s.handleMailFrom(m[1], size)
 		case "RCPT":
 			s.handleRcpt(line)
 		case "DATA":
@@ -266,8 +280,11 @@ func (s *session) handleHello(greeting, host string) {
 	if s.srv.TLSConfig != nil {
 		extensions = append(extensions, "250-STARTTLS")
 	}
-	extensions = append(extensions, "250-PIPELINING",
-		"250-SIZE 10240000",
+	if s.srv.MaxSize != 0 {
+		extensions = append(extensions, fmt.Sprintf("250-SIZE %d", s.srv.MaxSize))
+	}
+	extensions = append(extensions,
+		"250-PIPELINING",
 		"250-ENHANCEDSTATUSCODES",
 		"250-8BITMIME",
 		"250 DSN")
@@ -291,7 +308,7 @@ func (s *session) handleStartTLS() error {
 	return nil
 }
 
-func (s *session) handleMailFrom(email string) {
+func (s *session) handleMailFrom(email string, size *int) {
 	// TODO: 4.1.1.11.  If the server SMTP does not recognize or
 	// cannot implement one or more of the parameters associated
 	// qwith a particular MAIL FROM or RCPT TO command, it will return
@@ -308,7 +325,7 @@ func (s *session) handleMailFrom(email string) {
 		return
 	}
 	s.env = nil
-	env, err := cb(s, addrString(email))
+	env, err := cb(s, addrString(email), size)
 	if err != nil {
 		log.Printf("rejecting MAIL FROM %q: %v", email, err)
 		s.sendf("451 denied\r\n")
