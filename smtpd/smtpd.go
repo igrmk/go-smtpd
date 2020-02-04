@@ -263,7 +263,6 @@ func (s *session) serve() {
 		case "DATA":
 			s.handleData()
 		default:
-			log.Printf("Client: %q, verhb: %q", line, line.Verb())
 			s.sendlinef("502 5.5.2 Error: command not recognized")
 		}
 	}
